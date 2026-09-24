@@ -6,11 +6,17 @@ Walks every repo in a GitHub org and classifies each as API-service,
 event-driven-service, or both — based on framework/SDK signatures found
 in source files. Produces a CSV registry to seed the microservice inventory.
 
+Two sources (pick exactly one):
+    --repos-root PATH   scan git clones already on local disk (no network, no token)
+    --org NAME          scan a GitHub org via the API (needs GITHUB_TOKEN)
+
 Usage:
+    python inventory_scan.py --repos-root ~/workspace/repos --out inventory.csv
+
     export GITHUB_TOKEN=ghp_xxx
     python inventory_scan.py --org YOUR_ORG_NAME --out inventory.csv
 
-Requires: pip install requests
+Requires: pip install requests   (only needed for --org mode)
 """
 
 import argparse
@@ -18,10 +24,15 @@ import base64
 import csv
 import os
 import re
+import subprocess
 import sys
 import time
+from pathlib import Path
 
-import requests
+try:
+    import requests
+except ImportError:  # local mode works without it
+    requests = None
 
 GITHUB_API = "https://api.github.com"
 
@@ -60,6 +71,17 @@ EVENT_SIGNATURES = {
     ],
     "node_kafka": [
         r"kafkajs", r"kafka-node",
+    ],
+    "node_aws_sdk_v2": [
+        r"new AWS\.(SQS|SNS)\(", r"require\(['\"]aws-sdk['\"]\)",
+    ],
+    "lambda_handler": [
+        r"exports\.handler\s*=", r"export\s+(const|async function|function)\s+handler",
+        r"def lambda_handler\(", r"implements RequestHandler<",
+    ],
+    "iac_event_resources": [
+        r"AWS::SQS::Queue", r"AWS::SNS::Topic", r"AWS::Serverless::Function",
+        r"AWS::Lambda::EventSourceMapping",
     ],
 }
 
@@ -132,9 +154,15 @@ def candidate_source_files(tree_paths, langs, limit=40):
         and "/test/" not in p and "/tests/" not in p
         and "node_modules/" not in p
     ]
+    # Infrastructure templates (SAM/CloudFormation) declare queues, topics and Lambdas
+    candidates += [
+        p for p in tree_paths
+        if p.endswith((".yaml", ".yml")) and "template" in p.lower()
+    ]
     # Prioritize files whose names suggest controllers/consumers/listeners
     priority_kw = ["controller", "route", "listener", "consumer", "producer",
-                   "handler", "subscriber", "publisher", "sqs", "sns", "kafka"]
+                   "handler", "subscriber", "publisher", "sqs", "sns", "kafka",
+                   "processor", "template"]
     candidates.sort(key=lambda p: (
         0 if any(k in p.lower() for k in priority_kw) else 1
     ))
@@ -157,10 +185,9 @@ def fetch_file_content(owner, repo, path, token):
     return ""
 
 
-def scan_repo(owner, repo_name, default_branch, token):
-    tree = get_default_branch_tree(owner, repo_name, default_branch, token)
-    tree_paths = [t["path"] for t in tree if t.get("type") == "blob"]
-
+def classify_paths(tree_paths, read_file, throttle=0.0):
+    """Shared classification logic. `read_file(path)` returns file text, so the
+    same detection runs against the GitHub API or a local checkout."""
     if not tree_paths:
         return {
             "is_api": False, "is_event": False, "languages": "",
@@ -175,14 +202,15 @@ def scan_repo(owner, repo_name, default_branch, token):
 
     is_api, is_event = False, False
     for path in files_to_scan:
-        content = fetch_file_content(owner, repo_name, path, token)
+        content = read_file(path)
         if not is_api and any(re.search(p, content) for p in all_api_patterns):
             is_api = True
         if not is_event and any(re.search(p, content) for p in all_event_patterns):
             is_event = True
         if is_api and is_event:
             break
-        time.sleep(0.05)  # be gentle on rate limits
+        if throttle:
+            time.sleep(throttle)  # be gentle on rate limits
 
     return {
         "is_api": is_api,
@@ -193,36 +221,106 @@ def scan_repo(owner, repo_name, default_branch, token):
     }
 
 
+def scan_repo(owner, repo_name, default_branch, token):
+    tree = get_default_branch_tree(owner, repo_name, default_branch, token)
+    tree_paths = [t["path"] for t in tree if t.get("type") == "blob"]
+    return classify_paths(
+        tree_paths,
+        lambda p: fetch_file_content(owner, repo_name, p, token),
+        throttle=0.05,
+    )
+
+
+# --- Local (system directory) mode ---------------------------------------
+
+def run_git(repo_path, *args):
+    result = subprocess.run(
+        ["git", "-C", str(repo_path), *args],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def list_local_repos(root):
+    """Immediate subdirectories of `root` that are real git clones."""
+    root = Path(root).expanduser().resolve()
+    if not root.is_dir():
+        raise SystemExit(f"ERROR: --repos-root '{root}' is not a directory.")
+    return sorted(p for p in root.iterdir() if p.is_dir() and (p / ".git").exists())
+
+
+def scan_local_repo(repo_path):
+    tree_paths = run_git(repo_path, "ls-files").splitlines()
+
+    def read_file(rel):
+        try:
+            return (repo_path / rel).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            return ""
+
+    result = classify_paths(tree_paths, read_file)
+    result["head_sha"] = run_git(repo_path, "rev-parse", "HEAD")
+    result["default_branch"] = run_git(repo_path, "rev-parse", "--abbrev-ref", "HEAD") or "unknown"
+    result["repo_url"] = run_git(repo_path, "remote", "get-url", "origin")
+    return result
+
+
+FIELDNAMES = [
+    "repo_name", "repo_url", "default_branch", "head_sha", "languages",
+    "flow_type", "sample_files_scanned", "notes",
+]
+
+
+def collect_local(root, limit):
+    repos = list_local_repos(root)
+    if limit:
+        repos = repos[:limit]
+    print(f"Found {len(repos)} git clones under {Path(root).expanduser()}. Scanning...")
+    for i, path in enumerate(repos, 1):
+        print(f"[{i}/{len(repos)}] {path.name}")
+        result = scan_local_repo(path)
+        yield path.name, result["repo_url"], result["default_branch"], result
+
+
+def collect_github(org, limit):
+    if requests is None:
+        raise SystemExit("ERROR: --org mode needs 'pip install requests'.")
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        raise SystemExit("ERROR: set GITHUB_TOKEN env var with a PAT that has repo read access.")
+    print(f"Listing repos for org '{org}'...")
+    repos = list_org_repos(org, token)
+    if limit:
+        repos = repos[:limit]
+    print(f"Found {len(repos)} repos. Scanning...")
+    for i, repo in enumerate(repos, 1):
+        name = repo["name"]
+        default_branch = repo.get("default_branch", "main")
+        print(f"[{i}/{len(repos)}] {name} (branch: {default_branch})")
+        try:
+            result = scan_repo(repo["owner"]["login"], name, default_branch, token)
+        except requests.HTTPError as e:
+            result = {"is_api": False, "is_event": False, "languages": "",
+                      "sample_files_scanned": 0, "notes": f"error: {e}"}
+        yield name, repo["html_url"], default_branch, result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Phase 0 microservice inventory scanner")
-    parser.add_argument("--org", required=True, help="GitHub org name")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--repos-root", help="Directory containing local git clones (one per service)")
+    source.add_argument("--org", help="GitHub org name (uses the API; needs GITHUB_TOKEN)")
     parser.add_argument("--out", default="inventory.csv", help="Output CSV path")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of repos scanned (0 = no limit)")
     args = parser.parse_args()
 
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        print("ERROR: set GITHUB_TOKEN env var with a PAT that has repo read access.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Listing repos for org '{args.org}'...")
-    repos = list_org_repos(args.org, token)
-    if args.limit:
-        repos = repos[: args.limit]
-    print(f"Found {len(repos)} repos. Scanning...")
+    if args.repos_root:
+        source_iter = collect_local(args.repos_root, args.limit)
+    else:
+        source_iter = collect_github(args.org, args.limit)
 
     rows = []
-    for i, repo in enumerate(repos, 1):
-        name = repo["name"]
-        owner = repo["owner"]["login"]
-        default_branch = repo.get("default_branch", "main")
-        print(f"[{i}/{len(repos)}] {name} (branch: {default_branch})")
-        try:
-            result = scan_repo(owner, name, default_branch, token)
-        except requests.HTTPError as e:
-            result = {"is_api": False, "is_event": False, "languages": "",
-                      "sample_files_scanned": 0, "notes": f"error: {e}"}
-
+    for name, url, branch, result in source_iter:
         flow_type = []
         if result["is_api"]:
             flow_type.append("API")
@@ -233,8 +331,9 @@ def main():
 
         rows.append({
             "repo_name": name,
-            "repo_url": repo["html_url"],
-            "default_branch": default_branch,
+            "repo_url": url,
+            "default_branch": branch,  # local mode: the branch currently checked out
+            "head_sha": result.get("head_sha", ""),
             "languages": result["languages"],
             "flow_type": "+".join(flow_type),
             "sample_files_scanned": result["sample_files_scanned"],
@@ -242,17 +341,14 @@ def main():
         })
 
     with open(args.out, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [
-            "repo_name", "repo_url", "default_branch", "languages",
-            "flow_type", "sample_files_scanned", "notes",
-        ])
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 
     print(f"\nDone. Wrote {len(rows)} rows to {args.out}")
     unclassified = [r for r in rows if r["flow_type"] == "Unclassified"]
     if unclassified:
-        print(f"NOTE: {len(unclassified)} repos were unclassified — review these manually "
+        print(f"NOTE: {len(unclassified)} repos were unclassified - review these manually "
               f"(may need more sample files scanned, or aren't microservices at all).")
 
 

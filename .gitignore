@@ -4,3 +4,4 @@
 # Third-party repos used as POC input; referenced from local disk, not redistributed
 poc/api-service/
 poc/event-lambda-service/
+__pycache__/
