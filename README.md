@@ -76,7 +76,7 @@ Each repo's tracked files are sampled (up to 40 files, prioritising names like c
 `poc/` holds a worked example. See [poc/README.md](poc/README.md).
 
 - The POC inputs are third-party open-source repos (a Spring Boot API service and an AWS SNS/SQS Lambda sample). They are **not committed**; place copies under `poc/api-service` and `poc/event-lambda-service` to make the doc links resolve.
-- Sample output: [poc/docs/organization-service_with-departments-and-employees_flow.md](poc/docs/organization-service_with-departments-and-employees_flow.md). It found a hidden 3-service fan-out, no timeouts or circuit breakers, and a config repo outside the traced code.
+- Sample output: [poc/docs/organization-service_with-departments-and-employees_flow.md](poc/docs/organization-service_with-departments-and-employees_flow.md). It found a hidden 3-service fan-out, no circuit-breaker dependency or timeout settings in the traced repos (timeouts could still live in the external config service), and a config repo outside the traced code.
 
 Scan the POC clones locally:
 

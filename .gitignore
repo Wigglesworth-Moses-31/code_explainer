@@ -5,3 +5,6 @@
 poc/api-service/
 poc/event-lambda-service/
 __pycache__/
+
+# Generated scan output lists internal service names and URLs; never commit
+*.csv

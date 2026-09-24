@@ -2,8 +2,8 @@
 """
 Phase 0 inventory scanner.
 
-Walks every repo in a GitHub org and classifies each as API-service,
-event-driven-service, or both — based on framework/SDK signatures found
+Walks every repo (local git clones, or a GitHub org via the API) and classifies
+each as API-service, event-driven-service, or both — based on framework/SDK signatures found
 in source files. Produces a CSV registry to seed the microservice inventory.
 
 Two sources (pick exactly one):
@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     import requests
@@ -37,7 +38,7 @@ except ImportError:  # local mode works without it
 GITHUB_API = "https://api.github.com"
 
 # --- Detection signatures -----------------------------------------------
-# File-name globs (via GitHub code search) and content regexes used to
+# Content regexes matched against sampled source files to
 # decide whether a repo exposes APIs, consumes/produces events, or both.
 
 API_SIGNATURES = {
@@ -234,11 +235,27 @@ def scan_repo(owner, repo_name, default_branch, token):
 # --- Local (system directory) mode ---------------------------------------
 
 def run_git(repo_path, *args):
+    # fsmonitor disabled so a cloned repo's config cannot make git run a helper command
     result = subprocess.run(
-        ["git", "-C", str(repo_path), *args],
+        ["git", "-c", "core.fsmonitor=false", "-C", str(repo_path), *args],
         capture_output=True, text=True,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def strip_url_credentials(url):
+    """Remove user:token@ from http(s) remote URLs so secrets never reach the CSV."""
+    parts = urlsplit(url)
+    if parts.scheme in ("http", "https") and "@" in parts.netloc:
+        return urlunsplit(parts._replace(netloc=parts.netloc.rsplit("@", 1)[1]))
+    return url
+
+
+def csv_safe(value):
+    """Neutralise spreadsheet formula injection (cells starting with = + - @)."""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@"):
+        return "'" + value
+    return value
 
 
 def list_local_repos(root):
@@ -261,7 +278,7 @@ def scan_local_repo(repo_path):
     result = classify_paths(tree_paths, read_file)
     result["head_sha"] = run_git(repo_path, "rev-parse", "HEAD")
     result["default_branch"] = run_git(repo_path, "rev-parse", "--abbrev-ref", "HEAD") or "unknown"
-    result["repo_url"] = run_git(repo_path, "remote", "get-url", "origin")
+    result["repo_url"] = strip_url_credentials(run_git(repo_path, "remote", "get-url", "origin"))
     return result
 
 
@@ -343,7 +360,7 @@ def main():
     with open(args.out, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows({k: csv_safe(v) for k, v in row.items()} for row in rows)
 
     print(f"\nDone. Wrote {len(rows)} rows to {args.out}")
     unclassified = [r for r in rows if r["flow_type"] == "Unclassified"]
