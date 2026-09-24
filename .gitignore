@@ -8,3 +8,15 @@ __pycache__/
 
 # Generated scan output lists internal service names and URLs; never commit
 *.csv
+
+# Guardrails: real-service clones, generated docs and scan output must never enter this public repo
+/repos/
+/workspace/
+/services/
+/output/
+/private/
+/docs-private/
+poc/docs-private/
+*.log
+.env
+.env.*

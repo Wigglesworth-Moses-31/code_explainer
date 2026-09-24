@@ -90,7 +90,9 @@ Each flow doc contains: overview, entry point, hop-by-hop call flow, payload con
 
 ## Working with real services
 
-Generated docs will contain internal hostnames, queue names, and endpoints. Keep them in a **private** repo.
+This repo is public. Generated docs will contain internal hostnames, queue names, and endpoints, so keep them in a **private** repo, and never place real service clones or generated docs inside this folder. `.gitignore` blocks common locations (`repos/`, `workspace/`, `output/`, `private/`, `*.csv`), but check `git status` before every `git add` and never use `git add .` blindly.
+
+Prefer local mode (`--repos-root`): it needs no token. If you use `--org`, set `GITHUB_TOKEN` for the session only and keep it out of shell history and files.
 
 ## Roadmap
 
